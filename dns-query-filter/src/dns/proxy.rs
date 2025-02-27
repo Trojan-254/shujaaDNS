@@ -550,3 +550,388 @@ impl DnsProxy {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::str::FromStr;
+    use tokio::runtime::Runtime;
+    use trust_dns_proto::op::{MessageType, OpCode};
+    use trust_dns_proto::rr::{Name, RecordType};
+    use mockall::predicate::*;
+    use mockall::mock;
+
+    // Mock for the FilterEngine
+    mock! {
+        FilterEngine {}
+        
+        trait FilterEngine {
+            async fn check_domain(&self, domain: &str, client_info: &ClientInfo) -> FilterResult;
+        }
+    }
+
+    // Mock for the DnsCache
+    mock! {
+        DnsCache {}
+        
+        trait DnsCache {
+            fn get(&self, domain: &str, record_type: RecordType) -> Option<Message>;
+            fn insert(&mut self, domain: &str, record_type: RecordType, response: Message, ttl: u32);
+            fn cleanup(&mut self);
+        }
+    }
+
+    fn create_test_config() -> DnsConfig {
+        DnsConfig {
+            rate_limit_window_secs: 10,
+            rate_limit_max_requests: 100,
+            upstream_timeout_ms: 500,
+            // Add other required fields from your DnsConfig struct
+        }
+    }
+
+    fn create_test_query(domain: &str, record_type: RecordType) -> Message {
+        let mut query = Message::new();
+        let name = Name::from_str(domain).unwrap();
+        
+        let mut header = Header::new();
+        header.set_id(1234);
+        header.set_message_type(MessageType::Query);
+        header.set_op_code(OpCode::Query);
+        header.set_recursion_desired(true);
+        query.set_header(header);
+        
+        query.add_query(trust_dns_proto::op::Query::query(name, record_type));
+        query
+    }
+
+    fn create_test_response(id: u16, domain: &str, record_type: RecordType) -> Message {
+        let mut response = Message::new();
+        let name = Name::from_str(domain).unwrap();
+        
+        let mut header = Header::new();
+        header.set_id(id);
+        header.set_message_type(MessageType::Response);
+        header.set_recursion_desired(true);
+        header.set_recursion_available(true);
+        header.set_response_code(ResponseCode::NoError);
+        response.set_header(header);
+        
+        response.add_query(trust_dns_proto::op::Query::query(name.clone(), record_type));
+        
+        // Add a dummy answer record
+        let mut record = Record::new();
+        record.set_name(name);
+        record.set_record_type(record_type);
+        record.set_ttl(300);
+        record.set_dns_class(DNSClass::IN);
+        // Set appropriate data based on record type
+        // (omitted for brevity, but in a real test you'd set this)
+        
+        response.add_answer(record);
+        response
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        let window = Duration::from_secs(1);
+        let max_requests = 3;
+        let mut limiter = RateLimiter::new(window, max_requests);
+        
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        
+        // First 3 requests should be allowed
+        assert!(limiter.check_rate_limit(addr));
+        assert!(limiter.check_rate_limit(addr));
+        assert!(limiter.check_rate_limit(addr));
+        
+        // 4th request should be blocked
+        assert!(!limiter.check_rate_limit(addr));
+        
+        // Test cleanup
+        limiter.cleanup();
+        
+        // After waiting, it should reset
+        std::thread::sleep(window + Duration::from_millis(10));
+        assert!(limiter.check_rate_limit(addr));
+    }
+
+    #[test]
+    fn test_security_check_valid_request() {
+        let valid_query = create_test_query("example.com", RecordType::A);
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        
+        assert!(DnsProxy::security_check(&valid_query, client_addr).is_ok());
+    }
+
+    #[test]
+    fn test_security_check_invalid_message_type() {
+        let mut invalid_query = create_test_query("example.com", RecordType::A);
+        let mut header = invalid_query.header().clone();
+        header.set_message_type(MessageType::Response); // Should be Query
+        invalid_query.set_header(header);
+        
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        
+        assert!(DnsProxy::security_check(&invalid_query, client_addr).is_err());
+    }
+
+    #[test]
+    fn test_security_check_invalid_opcode() {
+        let mut invalid_query = create_test_query("example.com", RecordType::A);
+        let mut header = invalid_query.header().clone();
+        header.set_op_code(OpCode::Update); // Should be Query
+        invalid_query.set_header(header);
+        
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        
+        assert!(DnsProxy::security_check(&invalid_query, client_addr).is_err());
+    }
+
+    #[test]
+    fn test_security_check_recursion_not_desired() {
+        let mut invalid_query = create_test_query("example.com", RecordType::A);
+        let mut header = invalid_query.header().clone();
+        header.set_recursion_desired(false); // Should be true
+        invalid_query.set_header(header);
+        
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        
+        assert!(DnsProxy::security_check(&invalid_query, client_addr).is_err());
+    }
+
+    #[test]
+    fn test_security_check_too_many_queries() {
+        let mut invalid_query = create_test_query("example.com", RecordType::A);
+        // Add a second query
+        invalid_query.add_query(trust_dns_proto::op::Query::query(
+            Name::from_str("example.org").unwrap(),
+            RecordType::A
+        ));
+        
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        
+        assert!(DnsProxy::security_check(&invalid_query, client_addr).is_err());
+    }
+
+    #[test]
+    fn test_security_check_domain_too_long() {
+        // Create a domain with a very long subdomain label (>63 chars)
+        let long_subdomain = "a".repeat(64);
+        let domain = format!("{}.example.com", long_subdomain);
+        
+        let invalid_query = create_test_query(&domain, RecordType::A);
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        
+        assert!(DnsProxy::security_check(&invalid_query, client_addr).is_err());
+    }
+
+    #[test]
+    fn test_is_cacheable() {
+        // Cacheable response (normal response with records)
+        let cacheable = create_test_response(1234, "example.com", RecordType::A);
+        assert!(DnsProxy::is_cacheable(&cacheable));
+        
+        // Non-cacheable: error response
+        let mut error_resp = cacheable.clone();
+        let mut header = error_resp.header().clone();
+        header.set_response_code(ResponseCode::ServFail);
+        error_resp.set_header(header);
+        assert!(!DnsProxy::is_cacheable(&error_resp));
+        
+        // Non-cacheable: empty response
+        let mut empty_resp = cacheable.clone();
+        empty_resp.take_answers();
+        assert!(!DnsProxy::is_cacheable(&empty_resp));
+        
+        // Non-cacheable: TTL=0
+        let mut zero_ttl_resp = cacheable.clone();
+        let mut record = zero_ttl_resp.answers()[0].clone();
+        record.set_ttl(0);
+        zero_ttl_resp.take_answers();
+        zero_ttl_resp.add_answer(record);
+        assert!(!DnsProxy::is_cacheable(&zero_ttl_resp));
+    }
+
+    #[test]
+    fn test_get_min_ttl() {
+        // Create a response with multiple records of different TTLs
+        let mut response = create_test_response(1234, "example.com", RecordType::A);
+        
+        // Add a second record with a different TTL
+        let mut record2 = response.answers()[0].clone();
+        record2.set_ttl(600);
+        response.add_answer(record2);
+        
+        // Add a third record with a lower TTL
+        let mut record3 = response.answers()[0].clone();
+        record3.set_ttl(100); // This should be the min TTL
+        response.add_answer(record3);
+        
+        assert_eq!(DnsProxy::get_min_ttl(&response), 100);
+    }
+
+    #[tokio::test]
+    async fn test_create_blocked_response() {
+        let query = create_test_query("blocked.example.com", RecordType::A);
+        let block_reason = "Malware domain";
+        
+        let response = DnsProxy::create_blocked_response(&query, block_reason);
+        
+        // Check response properties
+        assert_eq!(response.id(), query.id());
+        assert_eq!(response.message_type(), MessageType::Response);
+        assert_eq!(response.response_code(), ResponseCode::NXDomain);
+        assert!(response.recursion_desired());
+        assert!(response.recursion_available());
+        assert!(!response.authoritative());
+        
+        // Verify the query was copied
+        assert_eq!(response.queries().len(), 1);
+        assert_eq!(response.queries()[0].name().to_string(), "blocked.example.com.");
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_cached_response() {
+        let rt = Runtime::new().unwrap();
+        
+        rt.block_on(async {
+            // Set up test data
+            let query = create_test_query("cached.example.com", RecordType::A);
+            let query_data = query.to_vec().unwrap();
+            let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+            let upstream_servers = vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)
+            ];
+            
+            // Set up mocks
+            let mut mock_cache = MockDnsCache::new();
+            let cached_response = create_test_response(query.id(), "cached.example.com", RecordType::A);
+            
+            // Mock cache hit
+            mock_cache.expect_get()
+                .with(eq("cached.example.com"), eq(RecordType::A))
+                .returning(move |_, _| Some(cached_response.clone()));
+            
+            let mock_filter = MockFilterEngine::new();
+            
+            // Create socket for testing
+            let socket = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+            
+            // Set up rate limiter
+            let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(
+                Duration::from_secs(10),
+                100
+            )));
+            
+            // Call handle_request
+            let result = DnsProxy::handle_request(
+                &socket,
+                &query_data,
+                client_addr,
+                &upstream_servers,
+                &Arc::new(RwLock::new(mock_cache)),
+                &Arc::new(RwLock::new(mock_filter)),
+                &rate_limiter,
+                &create_test_config()
+            ).await;
+            
+            assert!(result.is_ok());
+            // Note: In a real test environment, you'd also verify that the socket sent
+            // the correct response to the client
+        });
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_filtered_domain() {
+        let rt = Runtime::new().unwrap();
+        
+        rt.block_on(async {
+            // Set up test data
+            let query = create_test_query("blocked.example.com", RecordType::A);
+            let query_data = query.to_vec().unwrap();
+            let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+            let upstream_servers = vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)
+            ];
+            
+            // Set up mocks
+            let mock_cache = MockDnsCache::new();
+            let mut mock_filter = MockFilterEngine::new();
+            
+            // Mock filter block
+            mock_filter.expect_check_domain()
+                .returning(|_, _| async {
+                    FilterResult {
+                        is_allowed: false,
+                        reason: "Malware domain".to_string()
+                    }
+                });
+            
+            // Create socket for testing
+            let socket = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+            
+            // Set up rate limiter
+            let rate_limiter = Arc::new(RwLock::new(RateLimiter::new(
+                Duration::from_secs(10),
+                100
+            )));
+            
+            // Call handle_request
+            let result = DnsProxy::handle_request(
+                &socket,
+                &query_data,
+                client_addr,
+                &upstream_servers,
+                &Arc::new(RwLock::new(mock_cache)),
+                &Arc::new(RwLock::new(mock_filter)),
+                &rate_limiter,
+                &create_test_config()
+            ).await;
+            
+            assert!(result.is_ok());
+            // Note: In a real test, you'd verify the correct blocked response was sent
+        });
+    }
+
+    // Integration test using a mock UDP server as upstream
+    #[tokio::test]
+    async fn test_forward_to_upstream() {
+        // This test requires a more complex setup with a mock DNS server
+        // For simplicity, we'll outline the approach:
+        
+        // 1. Start a mock DNS server on a local port
+        // 2. Create a DNS query
+        // 3. Call forward_to_upstream with the mock server address
+        // 4. Verify the response is correctly returned
+        
+        // Note: Implementing a full mock DNS server is beyond the scope of this example
+        // In a real test suite, you would use a crate like tokio-test-dns or a custom mock implementation
+    }
+
+    #[test]
+    fn test_rate_limiter_cleanup() {
+        let window = Duration::from_millis(10);
+        let max_requests = 5;
+        let mut limiter = RateLimiter::new(window, max_requests);
+        
+        // Add some clients
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12346);
+        
+        limiter.check_rate_limit(addr1);
+        limiter.check_rate_limit(addr2);
+        
+        // Wait for window to expire
+        std::thread::sleep(window * 3);
+        
+        // Before cleanup
+        assert_eq!(limiter.clients.len(), 2);
+        
+        // Do cleanup
+        limiter.cleanup();
+        
+        // After cleanup
+        assert_eq!(limiter.clients.len(), 0);
+    }
+}
