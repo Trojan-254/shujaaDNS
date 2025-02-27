@@ -151,9 +151,8 @@ impl DnsProxy {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                if let Ok(mut limiter) = rate_limiter_cleanup.write().await {
-                    limiter.cleanup();
-                }
+                let mut limiter = rate_limiter_cleanup.write().await;
+                limiter.cleanup();
             }
         });
         
@@ -561,20 +560,22 @@ mod tests {
     use mockall::predicate::*;
     use mockall::mock;
 
-    // Mock for the FilterEngine
+    // Define FilterResult for testing
+    #[derive(Clone)]
+    struct FilterResult {
+        is_allowed: bool,
+        reason: String,
+    }
+
     mock! {
-        FilterEngine {}
-        
-        trait FilterEngine {
+        pub FilterEngine {
             async fn check_domain(&self, domain: &str, client_info: &ClientInfo) -> FilterResult;
         }
     }
 
     // Mock for the DnsCache
     mock! {
-        DnsCache {}
-        
-        trait DnsCache {
+        pub DnsCache {
             fn get(&self, domain: &str, record_type: RecordType) -> Option<Message>;
             fn insert(&mut self, domain: &str, record_type: RecordType, response: Message, ttl: u32);
             fn cleanup(&mut self);
