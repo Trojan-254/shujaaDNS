@@ -582,14 +582,18 @@ mod tests {
         }
     }
 
-    fn create_test_config() -> DnsConfig {
-        DnsConfig {
-            rate_limit_window_secs: 10,
-            rate_limit_max_requests: 100,
-            upstream_timeout_ms: 500,
-            // Add other required fields from your DnsConfig struct
-        }
-    }
+    // fn create_test_config() -> DnsConfig {
+    //     DnsConfig {
+    //         port: 53,
+    //         bind_address: "",
+    //         upstream_servers: Vec<SocketAddr>,
+    //         upstream
+    //         rate_limit_window_secs: 10,
+    //         rate_limit_max_requests: 100,
+    //         upstream_timeout_ms: 500,
+            
+    //     }
+    // }
 
     fn create_test_query(domain: &str, record_type: RecordType) -> Message {
         let mut query = Message::new();
