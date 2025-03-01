@@ -292,8 +292,8 @@ macro_rules! error {
 }
 
 // Re-export these functions for macro usage
-pub use get_module_name;
-pub use log_internal;
+// pub use get_module_name;
+// pub use log_internal;
 
 #[cfg(test)]
 mod tests {
